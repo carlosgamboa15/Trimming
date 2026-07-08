@@ -1,9 +1,9 @@
 {
 
-"capacity" : 1e4,
+"capacity" : 80,
 
 "fixed_cost":{
-    "deficit" : 10,
+    "deficit" : 100,
     "storage": 1
 },
 
