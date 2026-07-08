@@ -1,0 +1,16 @@
+{
+
+"capacity" : 1e4,
+
+"fixed_cost":{
+    "deficit" : 10,
+    "storage": 1
+},
+
+"instalations" : [5, 10, 20],
+
+"demand" : [20, 30, 50],
+
+"sample_size" : 100
+
+}
