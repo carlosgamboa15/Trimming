@@ -6,10 +6,11 @@ using JuMP, Gurobi, JSON, Distributions, LazySets, Polyhedra, CDDLib, Dualizatio
 using GLM, DataFrames, Random, NearestNeighbors, StatsPlots
 const GUROBI_ENV = Gurobi.Env()
 
-
 data_file = joinpath(pwd(), "parameters.json")
 
 data = JSON.parsefile(data_file)
+
+Random.seed!(2025)
 
 function save_json(output_dict::Dict, path::String, output_name::String="output")
     jD = JSON.json(output_dict)
@@ -26,18 +27,14 @@ function open_json(input_file::String, path::String)
     return file_data
 end
 
-function scenarios(data, D, zstar)
-
-    Random.seed!(2025)
+function scenarios(data, D, ξ_dict, p)
 
     sample = collect(1:data["sample_size"])
 
-    p = length(zstar)
-
-    ξ_dict = Dict("zstar" => zstar, "PredictionStar" => zeros(D), "z" => [zeros(p) for n ∈ sample], "y" => [zeros(D) for n ∈ sample], "Ξ_y(z^*)" => zeros(D, 2))
-
     # contexts
     z = [trunc.(rand(Normal(1,0.5), p), digits=2) for n ∈ sample]
+
+    ξ_dict["z"] = z
 
     β0 = fill(10.0, D) 
     β = [rand(p).* 2.0 for d ∈ collect(1:D)]
@@ -50,6 +47,8 @@ function scenarios(data, D, zstar)
         for n ∈ sample
 
             ξ[n][d]  = β0[d] + dot(β[d],z[n]) + rand(Normal(0,σ))
+            # μ = β0[d] + dot(β[d], z[n])
+            # ξ[n][d] = rand(LogNormal(μ, σ))
 
         end
     end
@@ -80,8 +79,47 @@ function scenarios(data, D, zstar)
 
     ε = ξ - ξ_forcast
 
+    for n ∈ sample
+        for d ∈ collect(1:D)
+            ξ_dict["y"][n][d] = trunc(ε[n][d], digits=2)
+        end
+    end
+
+    return Models
+   
+end
+
+function forecast(D, zstar, Models)
+
+    # Prediction for z^*
+
+    PredictionStar = zeros(D)
+
+    for d in 1:D
+
+        PredictionStar[d] = predict(
+            Models[d],
+            DataFrame([Symbol("z$i") => [zstar[i]] for i in 1:p])
+        )[1]
+
+    end
+
+    PredictionStar = trunc.(PredictionStar, digits=2)
+
+    return PredictionStar
+
+end
+
+function uncertainty_set(ξ_dict, zstar)
+
+    z = ξ_dict["z"]
+    y = ξ_dict["y"]
+
+    p = length(z[1])
+    D = length(y[1])
+
     Z = [z[n][i] for n ∈ sample, i ∈ collect(1:p)]
-    Residuals = [trunc(ε[n][d], digits=2) for n ∈ sample, d ∈ collect(1:D)]
+    Residuals = [y[n][d] for n ∈ sample, d ∈ collect(1:D)]
 
     tree = KDTree(permutedims(Z))
 
@@ -107,29 +145,11 @@ function scenarios(data, D, zstar)
 
     end
 
-    # Prediction for z^*
+    Ξ_y = Matrix([Lower[:] Upper[:]])
 
-    PredictionStar = zeros(D)
+    return Ξ_y
 
-    for d in 1:D
-
-        PredictionStar[d] = predict(
-            Models[d],
-            DataFrame([Symbol("z$i") => [zstar[i]] for i in 1:p])
-        )[1]
-
-    end
-
-    ξ_dict["PredictionStar"] = trunc.(PredictionStar, digits=2)
-    for n ∈ sample
-        for d ∈ collect(1:D)
-            ξ_dict["y"][n][d] = trunc(ε[n][d], digits=2)
-        end
-    end
-    ξ_dict["Ξ_y(z^*)"] = Matrix([Lower[:] Upper[:]])
-
-    return ξ_dict
-   
+    
 end
 
 function recourse(data, instalations, demand, x, G, D)
@@ -156,32 +176,6 @@ function recourse(data, instalations, demand, x, G, D)
     
 end
 
-function recourse_test(data, instalations, demand, x, G, D, ξ_dict, y_opt)
-
-    deficit = data["fixed_cost"]["deficit"]
-    storage = data["fixed_cost"]["storage"]
-    cost = [norm([instalations["$G"][g], demand["$D"][d]], 2) for g ∈ 1:G, d ∈ 1:D]
-
-    PredictionStar = ξ_dict["PredictionStar"]
-
-    model =  Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0))
-    @variables(model, begin
-        y[1:G, 1:D] ≥ 0
-        u[1:D] ≥ 0
-        v[1:G] ≥ 0
-    end)
-
-    @constraints(model, begin
-        σ[g ∈ 1:G], sum(y[g, d] for d ∈ 1:D) + v[g] == x[g]
-        π[d ∈ 1:D], sum(y[g, d] for g ∈ 1:G) + u[d] ≥ PredictionStar[d] + y_opt[d]
-    end)
-
-    @objective(model, Min, sum(cost[g, d]*y[g, d] for g ∈ 1:G, d ∈ 1:D) + deficit*sum(u[d] for d ∈ 1:D) + storage*sum(v[g] for g ∈ 1:G))
-
-    return model
-    
-end
-
 function create_oracle_problem(data, instalations, demand, G, D)
 
     x = zeros(G)
@@ -199,11 +193,9 @@ function create_oracle_problem(data, instalations, demand, G, D)
 
 end
 
-function modify_oracle(m_oracle, obj, ξ_dict, n, x, λ, G, D)
+function modify_oracle(m_oracle, obj, ξ_dict, Ξ_y, n, x, λ, G, D, PredictionStar)
 
     y = ξ_dict["y"][n]
-    Ξ_y = ξ_dict["Ξ_y(z^*)"]
-    PredictionStar = ξ_dict["PredictionStar"]
 
     ex1 = @expression(m_oracle, QuadExpr())
     ex2 = @expression(m_oracle, AffExpr())
@@ -214,7 +206,6 @@ function modify_oracle(m_oracle, obj, ξ_dict, n, x, λ, G, D)
         a = Ξ_y[d,1]
         b = Ξ_y[d,2]
 
-        # Proyección de y sobre la caja
         yproj = clamp(y[d], a, b)
 
         Δpos = b - yproj
@@ -222,18 +213,14 @@ function modify_oracle(m_oracle, obj, ξ_dict, n, x, λ, G, D)
 
         π = m_oracle[Symbol("π[$d]")]
 
-        # Término π'y
         add_to_expression!(ex3, PredictionStar[d], π)
         add_to_expression!(ex3, yproj, π)
 
-        # Penalización constante de Wasserstein
         add_to_expression!(ex3, -λ*abs(y[d]-yproj))
 
-        # Movimiento hacia los extremos
         add_to_expression!(ex1, Δpos, π, m_oracle[:ηpos][d])
         add_to_expression!(ex1, -Δneg, π, m_oracle[:ηneg][d])
 
-        # Penalización Wasserstein asociada a los movimientos
         add_to_expression!(ex3, -λ*Δpos, m_oracle[:ηpos][d])
         add_to_expression!(ex3, -λ*Δneg, m_oracle[:ηneg][d])
 
@@ -247,11 +234,9 @@ function modify_oracle(m_oracle, obj, ξ_dict, n, x, λ, G, D)
 
 end
 
-function solve_oracle_problem(data, m_oracle, obj, ξ_dict, x, λ, μ, θ, G, D, tol, y_dict, π_dict, σ_dict, L, norm_l1_y, violation)
+function solve_oracle_problem(data, m_oracle, obj, ξ_dict, Ξ_y, x, λ, μ, θ, G, D, tol, y_dict, π_dict, σ_dict, L, violation, zstar, PredictionStar)
 
     y = ξ_dict["y"]
-    Ξ_y = ξ_dict["Ξ_y(z^*)"]
-    zstar = ξ_dict["zstar"]
     z = ξ_dict["z"]
     a = Ξ_y[:,1]
     b = Ξ_y[:,2]
@@ -260,7 +245,7 @@ function solve_oracle_problem(data, m_oracle, obj, ξ_dict, x, λ, μ, θ, G, D,
        
         if tol[n]        
             val, time = @timed(begin
-                modify_oracle(m_oracle, obj, ξ_dict, n, x, λ, G, D)
+                modify_oracle(m_oracle, obj, ξ_dict, Ξ_y, n, x, λ, G, D, PredictionStar)
                 optimize!(m_oracle)
                 status = termination_status(m_oracle)
                 if status != MOI.OPTIMAL
@@ -285,13 +270,12 @@ function solve_oracle_problem(data, m_oracle, obj, ξ_dict, x, λ, μ, θ, G, D,
             push!(y_dict["$n"], y_opt)
             push!(π_dict["$n"], π_opt)
             push!(σ_dict["$n"], σ_opt)
-            push!(norm_l1_y["$n"], norm(y_opt - y[n], 1))
         end
     end
     
 end
 
-function create_master_problem(data, G)
+function create_master_problem(data, G, ρ)
 
     N = data["sample_size"]
     capacity = data["capacity"]
@@ -320,17 +304,15 @@ function create_master_problem(data, G)
      return m_master
 end
 
-function update_master_CCG(data, m_master, ξ_dict, y_dict, norm_l1_y, G, D, tol)
+function update_master_CCG(data, m_master, ξ_dict, y_dict, G, D, tol, zstar, PredictionStar)
 
     N = data["sample_size"]
 
     deficit = data["fixed_cost"]["deficit"]
     storage = data["fixed_cost"]["storage"]
     cost = [norm([instalations["$G"][g], demand["$D"][d]], 2) for g ∈ 1:G, d ∈ 1:D]
-
-    zstar = ξ_dict["zstar"]
-    PredictionStar = ξ_dict["PredictionStar"]
     z = ξ_dict["z"]
+    y_scen = ξ_dict["y"]
 
     for n ∈ 1:N
 
@@ -339,6 +321,7 @@ function update_master_CCG(data, m_master, ξ_dict, y_dict, norm_l1_y, G, D, tol
         if tol[n]
 
             y_opt = y_dict["$n"][end]
+            norm_l1_y = norm(y_opt - y_scen[n], 1)
 
             y = @variable(m_master, [1:G, 1:D], lower_bound = 0)
             u = @variable(m_master, [1:D], lower_bound = 0)
@@ -347,7 +330,7 @@ function update_master_CCG(data, m_master, ξ_dict, y_dict, norm_l1_y, G, D, tol
                         [g ∈ 1:G], sum(y[g, d] for d ∈ 1:D) + v[g] == m_master[:x][g]
                         [d ∈ 1:D], sum(y[g, d] for g ∈ 1:G) + u[d] ≥ PredictionStar[d] + y_opt[d]
             end)
-            @constraint(m_master, sum(cost[g, d]*y[g, d] for g ∈ 1:G, d ∈ 1:D) + deficit*sum(u[d] for d ∈ 1:D) + storage*sum(v[g] for g ∈ 1:G) - m_master[:λ]*norm_l1_y["$n"][end] - m_master[:λ]*norm_l1_z ≤ m_master[:μ][n] + m_master[:θ])
+            @constraint(m_master, sum(cost[g, d]*y[g, d] for g ∈ 1:G, d ∈ 1:D) + deficit*sum(u[d] for d ∈ 1:D) + storage*sum(v[g] for g ∈ 1:G) - m_master[:λ]*norm_l1_y - m_master[:λ]*norm_l1_z ≤ m_master[:μ][n] + m_master[:θ])
         end
 
     end
@@ -355,13 +338,12 @@ function update_master_CCG(data, m_master, ξ_dict, y_dict, norm_l1_y, G, D, tol
     
 end
 
-function update_master_Benders(data, m_master, ξ_dict, y_dict, π_dict, σ_dict, norm_l1_y, G, D, tol)
+function update_master_Benders(data, m_master, ξ_dict, y_dict, π_dict, σ_dict, G, D, tol, zstar, PredictionStar)
 
     N = data["sample_size"]
 
-    zstar = ξ_dict["zstar"]
-    PredictionStar = ξ_dict["PredictionStar"]
     z = ξ_dict["z"]
+    y_scen = ξ_dict["y"]
 
     for n ∈ 1:N
 
@@ -373,7 +355,9 @@ function update_master_Benders(data, m_master, ξ_dict, y_dict, π_dict, σ_dict
             π_opt = π_dict["$n"][end]
             σ_opt = σ_dict["$n"][end]
 
-            @constraint(m_master, sum(σ_opt[g]*m_master[:x][g] for g ∈ 1:G) + sum(π_opt[d]*y_opt[d] for d ∈ 1:D) + sum(PredictionStar[d]*π_opt[d] for d ∈ 1:D) - m_master[:λ]*norm_l1_y["$n"][end] - m_master[:λ]*norm_l1_z ≤ m_master[:μ][n] + m_master[:θ])
+            norm_l1_y = norm(y_opt - y_scen[n], 1)
+
+            @constraint(m_master, sum(σ_opt[g]*m_master[:x][g] for g ∈ 1:G) + sum(π_opt[d]*y_opt[d] for d ∈ 1:D) + sum(PredictionStar[d]*π_opt[d] for d ∈ 1:D) - m_master[:λ]*norm_l1_y - m_master[:λ]*norm_l1_z ≤ m_master[:μ][n] + m_master[:θ])
         end
 
     end
@@ -381,7 +365,7 @@ function update_master_Benders(data, m_master, ξ_dict, y_dict, π_dict, σ_dict
     
 end
 
-function initilization_restricted_master_CCG(data, G, D,  m_master, ξ_dict)
+function initilization_restricted_master_CCG(data, G, D, m_master, ξ_dict, Ξ_y, zstar, PredictionStar)
 
     N = data["sample_size"]
 
@@ -389,23 +373,24 @@ function initilization_restricted_master_CCG(data, G, D,  m_master, ξ_dict)
     storage = data["fixed_cost"]["storage"]
     cost = [norm([instalations["$G"][g], demand["$D"][d]], 2) for g ∈ 1:G, d ∈ 1:D]
 
-    zstar = ξ_dict["zstar"]
-    PredictionStar = ξ_dict["PredictionStar"]
     z = ξ_dict["z"]
     y_scen = ξ_dict["y"]
+    a = Ξ_y[:,1]
+    b = Ξ_y[:,2]
 
     for n ∈ 1:N
 
-        y_mean = mean(y_scen)
+        yproj = [clamp(y_scen[n][d], a[d], b[d]) for d ∈ 1:D]
+
         norm_l1_z = norm(zstar - z[n], 1)
-        norm_l1_y = norm(y_mean - y_scen[n], 1)
+        norm_l1_y = norm(yproj - y_scen[n], 1)
 
         y = @variable(m_master, [1:G, 1:D], lower_bound = 0)
         u = @variable(m_master, [1:D], lower_bound = 0)
         v = @variable(m_master, [1:G], lower_bound = 0)
         @constraints(m_master, begin
                     [g ∈ 1:G], sum(y[g, d] for d ∈ 1:D) + v[g] == m_master[:x][g]
-                    [d ∈ 1:D], sum(y[g, d] for g ∈ 1:G) + u[d] ≥ PredictionStar[d] + y_mean[d]
+                    [d ∈ 1:D], sum(y[g, d] for g ∈ 1:G) + u[d] ≥ PredictionStar[d] + yproj[d]
         end)
         @constraint(m_master, sum(cost[g, d]*y[g, d] for g ∈ 1:G, d ∈ 1:D) + deficit*sum(u[d] for d ∈ 1:D) + storage*sum(v[g] for g ∈ 1:G) - m_master[:λ]*norm_l1_y - m_master[:λ]*norm_l1_z ≤ m_master[:μ][n] + m_master[:θ])
 
@@ -415,9 +400,9 @@ function initilization_restricted_master_CCG(data, G, D,  m_master, ξ_dict)
  
 end
 
-function warm_start_solution_CCG(data, G, ξ_dict, y_old)
+function warm_start_solution(data, G, ξ_dict, Ξ_y_new, y_old, L_old, zstar_new, PredictionStar_new)
 
-    m_master = create_master_problem(data, G)
+    m_master = create_master_problem(data, G, ρ)
 
     N = data["sample_size"]
 
@@ -425,35 +410,67 @@ function warm_start_solution_CCG(data, G, ξ_dict, y_old)
     storage = data["fixed_cost"]["storage"]
     cost = [norm([instalations["$G"][g], demand["$D"][d]], 2) for g ∈ 1:G, d ∈ 1:D]
 
-    zstar = ξ_dict["zstar"]
-    PredictionStar = ξ_dict["PredictionStar"]
-    z = ξ_dict["z"]
     y_scen = ξ_dict["y"]
+    z = ξ_dict["z"]
+
+    a = Ξ_y_new[:,1]
+    b = Ξ_y_new[:,2]
 
     for n ∈ 1:N
 
-        y_mean = mean(y_scen)
-        norm_l1_z = norm(zstar - z[n], 1)
-        norm_l1_y = norm(y_mean - y_scen[n], 1)
+        yproj = [clamp(y_scen[n][d], a[d], b[d]) for d ∈ 1:D]
+
+        norm_l1_z = norm(zstar_new - z[n], 1)
+        norm_l1_y = norm(yproj - y_scen[n], 1)
 
         y = @variable(m_master, [1:G, 1:D], lower_bound = 0)
         u = @variable(m_master, [1:D], lower_bound = 0)
         v = @variable(m_master, [1:G], lower_bound = 0)
         @constraints(m_master, begin
                     [g ∈ 1:G], sum(y[g, d] for d ∈ 1:D) + v[g] == m_master[:x][g]
-                    [d ∈ 1:D], sum(y[g, d] for g ∈ 1:G) + u[d] ≥ PredictionStar[d] + y_mean[d]
+                    [d ∈ 1:D], sum(y[g, d] for g ∈ 1:G) + u[d] ≥ PredictionStar_new[d] + yproj[d]
         end)
         @constraint(m_master, sum(cost[g, d]*y[g, d] for g ∈ 1:G, d ∈ 1:D) + deficit*sum(u[d] for d ∈ 1:D) + storage*sum(v[g] for g ∈ 1:G) - m_master[:λ]*norm_l1_y - m_master[:λ]*norm_l1_z ≤ m_master[:μ][n] + m_master[:θ])
 
+        if ~isempty(L_old["$n"])
+
+            for ℓ ∈ L_old["$n"]
+                y_opt = y_old["$n"][ℓ]
+                norm_l1_z = norm(zstar_new - z[n], 1)
+                norm_l1_y = norm(y_opt - y_scen[n], 1)
+
+                y = @variable(m_master, [1:G, 1:D], lower_bound = 0)
+                u = @variable(m_master, [1:D], lower_bound = 0)
+                v = @variable(m_master, [1:G], lower_bound = 0)
+                @constraints(m_master, begin
+                            [g ∈ 1:G], sum(y[g, d] for d ∈ 1:D) + v[g] == m_master[:x][g]
+                            [d ∈ 1:D], sum(y[g, d] for g ∈ 1:G) + u[d] ≥ PredictionStar_new[d] + y_opt[d]
+                end)
+                @constraint(m_master, sum(cost[g, d]*y[g, d] for g ∈ 1:G, d ∈ 1:D) + deficit*sum(u[d] for d ∈ 1:D) + storage*sum(v[g] for g ∈ 1:G) - m_master[:λ]*norm_l1_y - m_master[:λ]*norm_l1_z ≤ m_master[:μ][n] + m_master[:θ])
+            end
+
+        end
+
     end
 
-    return nothing
+    optimize!(m_master)
+    status = termination_status(m_master)
+    if status != MOI.OPTIMAL
+        error("problem $status")
+    end
+
+    x_warm = value.(m_master[:x])
+    λ_warm= value.(m_master[:λ])
+
+    μ_warm = value.(m_master[:μ])
+    θ_warm = value(m_master[:θ])
+
+
+    return x_warm, λ_warm, μ_warm, θ_warm
  
 end
 
 function solve_master_problem(m_master)
-
-    set_optimizer_attribute(m_master, "DualReductions", 0)
 
     optimize!(m_master)
     status = termination_status(m_master)
@@ -472,15 +489,13 @@ function solve_master_problem(m_master)
     
 end
 
-function critical_radius(data, ξ_dict, α; p = 1)
+function critical_radius(data, ξ_dict, Ξ_y, α, zstar; p = 1)
 
     N = data["sample_size"]
 
-    zstar = ξ_dict["zstar"]
     z = ξ_dict["z"]
     y = ξ_dict["y"]
 
-    Ξ_y = ξ_dict["Ξ_y(z^*)"]
     a = Ξ_y[:,1]
     b = Ξ_y[:,2]
 
@@ -531,21 +546,29 @@ instalations = open_json("instalations_dict.json", pwd())
 #   save_json(demand, pwd(), "demand_dict")
 demand = open_json("demand_dict.json", pwd())
 
-# ξ_dict = open_json("ξ_dict.json", pwd())
-
 G, D = 20, 50
 
 results = Dict("zstar" => [], "x_opt" => [], "λ_opt" => [], "θ_opt" => [], "iter" => [])
 
+sample = collect(1:data["sample_size"])
+
 # Context
+
 p = 3 # Dimension of the context
 zstar = trunc.(rand(Normal(1,0.5), p), digits=2)
 
-α = 0.5
-sample = collect(1:data["sample_size"])
+ξ_dict = Dict("z" => [zeros(p) for n ∈ sample], "y" => [zeros(D) for n ∈ sample], "Ξ_y(z^*)" => zeros(D, 2))
 
-ξ_dict = scenarios(data, D, zstar)
-ρ = 1.1*critical_radius(data, ξ_dict, α) 
+Models = scenarios(data, D, ξ_dict, p)
+
+Ξ_y = uncertainty_set(ξ_dict, zstar)
+
+PredictionStar = forecast(D, zstar, Models)
+
+# Trimming parameters
+
+α = 0.5
+ρ = critical_radius(data, ξ_dict, Ξ_y, α, zstar) 
 
 # CCG Algorithm
 
@@ -554,19 +577,26 @@ y_dict = Dict("$n" => [] for n ∈ sample)
 π_dict = Dict("$n" => [] for n ∈ sample) 
 σ_dict = Dict("$n" => [] for n ∈ sample)
 L = Dict("$n" => [] for n ∈ sample) 
-norm_l1_y = Dict("$n" => [] for n ∈ sample) 
 tol = [true for n ∈ sample]
 iter = 1
-m_master = create_master_problem(data, G)
-initilization_restricted_master_CCG(data, m_master, ξ_dict)
-@constraint(m_master, m_master[:θ] ≥ -1e4)
+m_master = create_master_problem(data, G, ρ)
+initilization_restricted_master_CCG(data, G, D, m_master, ξ_dict, Ξ_y, zstar, PredictionStar)
 m_oracle, obj  = create_oracle_problem(data, instalations, demand, G, D)
 while Base.any(tol) && iter ≤ 20
     global x_CCG, λ_CCG, μ_CCG, θ_CCG = solve_master_problem(m_master)
-    solve_oracle_problem(data, m_oracle, obj, ξ_dict, x_CCG, λ_CCG, μ_CCG, θ_CCG, G, D, tol, y_dict, π_dict, σ_dict, L, norm_l1_y, violation)
-    update_master_CCG(data, m_master, ξ_dict, y_dict, norm_l1_y, G, D, tol)
+    solve_oracle_problem(data, m_oracle, obj, ξ_dict, Ξ_y, x_CCG, λ_CCG, μ_CCG, θ_CCG, G, D, tol, y_dict, π_dict, σ_dict, L, violation, zstar, PredictionStar)
+    update_master_CCG(data, m_master, ξ_dict, y_dict, G, D, tol, zstar, PredictionStar)
     iter +=  1
 end
+
+y_old = copy(y_dict)
+L_old = copy(L)
+
+push!(results["zstar"], zstar)
+push!(results["x_opt"], x_CCG)
+push!(results["λ_opt"], λ_CCG)
+push!(results["θ_opt"], θ_CCG)
+push!(results["iter"], iter - 1)
 
 # Benders Multi-Cut Algorithm
 
@@ -575,31 +605,27 @@ y_dict = Dict("$n" => [] for n ∈ sample)
 π_dict = Dict("$n" => [] for n ∈ sample) 
 σ_dict = Dict("$n" => [] for n ∈ sample)
 L = Dict("$n" => [] for n ∈ sample) 
-norm_l1_y = Dict("$n" => [] for n ∈ sample) 
 tol = [true for n ∈ sample]
 iter = 1
-m_master = create_master_problem(data, G)
+m_master = create_master_problem(data, G, ρ)
 @constraint(m_master, m_master[:θ] ≥ -1e4)
+# initilization_restricted_master_Benders(data, G, D, m_master, ξ_dict)
 m_oracle, obj  = create_oracle_problem(data, instalations, demand, G, D)
 while Base.any(tol) && iter ≤ 100
     global x_Benders, λ_Benders, μ_Benders, θ_Benders = solve_master_problem(m_master)
-    solve_oracle_problem(data, m_oracle, obj, ξ_dict, x_Benders, λ_Benders, μ_Benders, θ_Benders, G, D, tol, y_dict, π_dict, σ_dict, L, norm_l1_y, violation)
-    update_master_Benders(data, m_master, ξ_dict, y_dict, π_dict, σ_dict, norm_l1_y, G, D, tol)
+    solve_oracle_problem(data, m_oracle, obj, ξ_dict, Ξ_y, x_Benders, λ_Benders, μ_Benders, θ_Benders, G, D, tol, y_dict, π_dict, σ_dict, L, violation, zstar, PredictionStar)
+    update_master_Benders(data, m_master, ξ_dict, y_dict, π_dict, σ_dict, G, D, tol, zstar, PredictionStar)
     iter +=  1
 end
 
-push!(results["zstar"], zstar)
-push!(results["x_opt"], x_CCG)
-push!(results["λ_opt"], λ_CCG)
-push!(results["θ_opt"], θ_CCG)
-push!(results["iter"], iter - 1)
-
 # New context
-ϵ = 0.1
+ϵ = 2
 zstar_new = trunc.(zstar .+ (rand(length(zstar)) .- 0.5) .* (2 * ϵ), digits=2)
 
-ξ_dict = scenarios(data, D, zstar_new)
-ρ = 1.1*critical_radius(data, ξ_dict, α) 
+Ξ_y_new = uncertainty_set(ξ_dict, zstar_new)
+
+PredictionStar_new = forecast(D, zstar_new, Models)
+ρ = 1.1*critical_radius(data, ξ_dict, Ξ_y_new, α, zstar_new) 
 
 # CCG Algorithm
 
@@ -608,17 +634,15 @@ y_dict = Dict("$n" => [] for n ∈ sample)
 π_dict = Dict("$n" => [] for n ∈ sample) 
 σ_dict = Dict("$n" => [] for n ∈ sample)
 L = Dict("$n" => [] for n ∈ sample) 
-norm_l1_y = Dict("$n" => [] for n ∈ sample) 
 tol = [true for n ∈ sample]
 iter = 1
-m_master = create_master_problem(data, G)
-initilization_restricted_master_CCG(data, m_master, ξ_dict)
-@constraint(m_master, m_master[:θ] ≥ -1e4)
+m_master = create_master_problem(data, G, ρ)
+initilization_restricted_master_CCG(data, G, D, m_master, ξ_dict, Ξ_y_new, zstar_new, PredictionStar_new)
 m_oracle, obj  = create_oracle_problem(data, instalations, demand, G, D)
 while Base.any(tol) && iter ≤ 20
     global x_CCG, λ_CCG, μ_CCG, θ_CCG = solve_master_problem(m_master)
-    solve_oracle_problem(data, m_oracle, obj, ξ_dict, x_CCG, λ_CCG, μ_CCG, θ_CCG, G, D, tol, y_dict, π_dict, σ_dict, L, norm_l1_y, violation)
-    update_master_CCG(data, m_master, ξ_dict, y_dict, norm_l1_y, G, D, tol)
+    solve_oracle_problem(data, m_oracle, obj, ξ_dict, Ξ_y_new, x_CCG, λ_CCG, μ_CCG, θ_CCG, G, D, tol, y_dict, π_dict, σ_dict, L, violation, zstar_new, PredictionStar_new)
+    update_master_CCG(data, m_master, ξ_dict, y_dict, G, D, tol, zstar_new, PredictionStar_new)
     iter +=  1
 end
 
@@ -627,3 +651,77 @@ push!(results["x_opt"], x_CCG)
 push!(results["λ_opt"], λ_CCG)
 push!(results["θ_opt"], θ_CCG)
 push!(results["iter"], iter - 1)
+
+# CCG with warm start
+
+violation = Dict("$n" => [] for n ∈ sample)
+y_dict = Dict("$n" => [] for n ∈ sample)
+π_dict = Dict("$n" => [] for n ∈ sample) 
+σ_dict = Dict("$n" => [] for n ∈ sample)
+L = Dict("$n" => [] for n ∈ sample) 
+tol = [true for n ∈ sample]
+iter = 1
+m_master = create_master_problem(data, G, ρ)
+m_oracle, obj  = create_oracle_problem(data, instalations, demand, G, D)
+while Base.any(tol) && iter ≤ 20
+    if iter == 1
+        global x_CCG, λ_CCG, μ_CCG, θ_CCG  = warm_start_solution(data, G, ξ_dict, Ξ_y_new, y_old, L_old, zstar_new, PredictionStar_new)
+    else
+        global x_CCG, λ_CCG, μ_CCG, θ_CCG = solve_master_problem(m_master)
+    end
+    solve_oracle_problem(data, m_oracle, obj, ξ_dict, Ξ_y_new, x_CCG, λ_CCG, μ_CCG, θ_CCG, G, D, tol, y_dict, π_dict, σ_dict, L, violation, zstar_new, PredictionStar_new)
+    update_master_CCG(data, m_master, ξ_dict, y_dict, G, D, tol, zstar_new, PredictionStar_new)
+    iter +=  1
+end
+
+push!(results["zstar"], zstar_new)
+push!(results["x_opt"], x_CCG)
+push!(results["λ_opt"], λ_CCG)
+push!(results["θ_opt"], θ_CCG)
+push!(results["iter"], iter - 1)
+
+# Benders Multi-Cut with warm start
+
+violation = Dict("$n" => [] for n ∈ sample)
+y_dict = Dict("$n" => [] for n ∈ sample) 
+π_dict = Dict("$n" => [] for n ∈ sample) 
+σ_dict = Dict("$n" => [] for n ∈ sample)
+L = Dict("$n" => [] for n ∈ sample) 
+tol = [true for n ∈ sample]
+iter = 1
+m_master = create_master_problem(data, G, ρ)
+m_oracle, obj  = create_oracle_problem(data, instalations, demand, G, D)
+while Base.any(tol) && iter ≤ 100
+        if iter == 1
+            global x_Benders, λ_Benders, μ_Benders, θ_Benders  = warm_start_solution(data, G, ξ_dict, Ξ_y_new, y_old, L_old, zstar_new, PredictionStar_new)
+        else
+            global x_Benders, λ_Benders, μ_Benders, θ_Benders = solve_master_problem(m_master)
+        end
+    solve_oracle_problem(data, m_oracle, obj, ξ_dict, Ξ_y, x_Benders, λ_Benders, μ_Benders, θ_Benders, G, D, tol, y_dict, π_dict, σ_dict, L, violation, zstar, PredictionStar)
+    update_master_Benders(data, m_master, ξ_dict, y_dict, π_dict, σ_dict, G, D, tol, zstar, PredictionStar)
+    iter +=  1
+end
+
+x_Benders_warm = x_Benders
+λ_Benders_warm = λ_Benders
+μ_Benders_warm = μ_Benders
+θ_Benders_warm = θ_Benders
+
+# Benders Multi-Cut with warm start
+
+violation = Dict("$n" => [] for n ∈ sample)
+y_dict = Dict("$n" => [] for n ∈ sample) 
+π_dict = Dict("$n" => [] for n ∈ sample) 
+σ_dict = Dict("$n" => [] for n ∈ sample)
+L = Dict("$n" => [] for n ∈ sample) 
+tol = [true for n ∈ sample]
+iter = 1
+m_master = create_master_problem(data, G, ρ)
+@constraint(m_master, m_master[:θ] ≥ -1e4)
+m_oracle, obj  = create_oracle_problem(data, instalations, demand, G, D)
+while Base.any(tol) && iter ≤ 100
+    global x_Benders, λ_Benders, μ_Benders, θ_Benders = solve_master_problem(m_master)
+    solve_oracle_problem(data, m_oracle, obj, ξ_dict, Ξ_y, x_Benders, λ_Benders, μ_Benders, θ_Benders, G, D, tol, y_dict, π_dict, σ_dict, L, violation, zstar, PredictionStar)
+    update_master_Benders(data, m_master, ξ_dict, y_dict, π_dict, σ_dict, G, D, tol, zstar, PredictionStar)
+    iter +=  1
+end
