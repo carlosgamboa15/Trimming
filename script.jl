@@ -179,7 +179,6 @@ end
 function create_oracle_problem(data, instalations, demand, G, D)
 
     x = zeros(G)
-    v = zeros(G)
     model = recourse(data, instalations, demand, x, G, D)
     m_oracle = dualize(model; dual_names = DualNames())
    
@@ -365,7 +364,7 @@ function update_master_Benders(data, m_master, ξ_dict, y_dict, π_dict, σ_dict
     
 end
 
-function initilization_restricted_master_CCG(data, G, D, m_master, ξ_dict, Ξ_y, zstar, PredictionStar)
+function initilization_restricted_master_CCG(data, instalations, demand, G, D, m_master, ξ_dict, Ξ_y, zstar, PredictionStar, α)
 
     N = data["sample_size"]
 
@@ -378,21 +377,196 @@ function initilization_restricted_master_CCG(data, G, D, m_master, ξ_dict, Ξ_y
     a = Ξ_y[:,1]
     b = Ξ_y[:,2]
 
-    for n ∈ 1:N
+    m = ceil(Int, N*α)
 
-        yproj = [clamp(y_scen[n][d], a[d], b[d]) for d ∈ 1:D]
+    dist = zeros(N)
+
+    for n in 1:N
+
+        dz = norm(z[n] - zstar, 1)
+
+        dy = 0.0
+        for d in 1:D
+            if y_scen[n][d] < a[d]
+                dy += a[d] - y_scen[n][d]
+            elseif y_scen[n][d] > b[d]
+                dy += y_scen[n][d] - b[d]
+            end
+        end
+
+        dist[n] = dz + dy
+
+    end
+
+    idx = sortperm(dist)
+
+    for k in 1:m
+
+        n = idx[k]
+
+        yproj = clamp.(y_scen[n], a, b)
 
         norm_l1_z = norm(zstar - z[n], 1)
         norm_l1_y = norm(yproj - y_scen[n], 1)
 
-        y = @variable(m_master, [1:G, 1:D], lower_bound = 0)
+        y = @variable(m_master, [1:G,1:D], lower_bound = 0)
         u = @variable(m_master, [1:D], lower_bound = 0)
         v = @variable(m_master, [1:G], lower_bound = 0)
+
         @constraints(m_master, begin
-                    [g ∈ 1:G], sum(y[g, d] for d ∈ 1:D) + v[g] == m_master[:x][g]
-                    [d ∈ 1:D], sum(y[g, d] for g ∈ 1:G) + u[d] ≥ PredictionStar[d] + yproj[d]
+            [g=1:G], sum(y[g,d] for d=1:D) + v[g] == m_master[:x][g]
+            [d=1:D], sum(y[g,d] for g=1:G) + u[d] >= PredictionStar[d] + yproj[d]
         end)
-        @constraint(m_master, sum(cost[g, d]*y[g, d] for g ∈ 1:G, d ∈ 1:D) + deficit*sum(u[d] for d ∈ 1:D) + storage*sum(v[g] for g ∈ 1:G) - m_master[:λ]*norm_l1_y - m_master[:λ]*norm_l1_z ≤ m_master[:μ][n] + m_master[:θ])
+
+        @constraint(
+            m_master,
+            sum(cost[g,d]*y[g,d] for g=1:G,d=1:D)
+            + deficit*sum(u)
+            + storage*sum(v)
+            - m_master[:λ]*(norm_l1_y + norm_l1_z)
+            <= m_master[:μ][n] + m_master[:θ]
+        )
+
+    end
+
+    return nothing
+ 
+end
+
+function deterministic_equivalent_problem(data, instalations, demand, y_list)
+
+    m = length(y_list)
+    capacity = data["capacity"]
+    deficit = data["fixed_cost"]["deficit"]
+    storage = data["fixed_cost"]["storage"]
+    cost = [norm([instalations["$G"][g], demand["$D"][d]], 2) for g ∈ 1:G, d ∈ 1:D]
+
+
+    model =  Model(optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0))
+    @variables(model, begin
+        x[1:G] ≥ 0
+        cost_recourse[1:m]
+    end)
+
+    @constraint(model, [g ∈ 1:G], x[g] ≤ capacity)
+
+    for k in 1:m
+ 
+        y_opt = y_list[k]
+
+        y = @variable(model, [1:G, 1:D], lower_bound = 0)
+        u = @variable(model, [1:D], lower_bound = 0)
+        v = @variable(model, [1:G], lower_bound = 0)
+
+        @constraints(model, begin
+            [g ∈ 1:G], sum(y[g, d] for d ∈ 1:D) + v[g] == x[g]
+            [d ∈ 1:D], sum(y[g, d] for g ∈ 1:G) + u[d] ≥ PredictionStar[d] + y_opt[d]
+            cost_recourse[k] == sum(cost[g, d]*y[g, d] for g ∈ 1:G, d ∈ 1:D) + deficit*sum(u[d] for d ∈ 1:D) + storage*sum(v[g] for g ∈ 1:G)
+        end)
+
+    end
+
+    @objective(model, Min, (1/m)*sum(cost_recourse[k] for k in 1:m))
+    optimize!(model)
+    status = termination_status(model)
+    if status != MOI.OPTIMAL
+        error(" Status: $(status)")
+    end
+
+    x = value.(model[:x])
+
+    return x
+   
+end
+
+function dual_vertices(data, instalations, demand, x, y_opt, PredictionStar)
+
+    model = recourse(data, instalations, demand, x, G, D)
+    m_oracle = dualize(model; dual_names = DualNames())
+    set_optimizer(m_oracle, optimizer_with_attributes(() -> Gurobi.Optimizer(GUROBI_ENV), "OutputFlag" => 0))
+
+    ex1 = @expression(m_oracle, QuadExpr())
+    ex2 = @expression(m_oracle, AffExpr())
+    ex3 = @expression(m_oracle, AffExpr())
+
+    for d in 1:D
+
+        π = m_oracle[Symbol("π[$d]")]
+
+        add_to_expression!(ex3, PredictionStar[d], π)
+        add_to_expression!(ex3, y_opt[d], π)
+
+    end
+
+    @objective(m_oracle, Max, obj + ex1 + ex2 + ex3)
+    optimize!(m_oracle)
+    status = termination_status(m_oracle)
+    if status != MOI.OPTIMAL
+        error(" Status: $(status)")
+    end
+
+    π_opt = [value(m_oracle[Symbol("π[$d]")]) for d ∈ 1:D]
+    σ_opt = [value(m_oracle[Symbol("σ[$g]")]) for g ∈ 1:G]
+
+    return π_opt, σ_opt
+end
+
+function initilization_restricted_master_Benders(data, instalations, demand, G, D, m_master, ξ_dict, Ξ_y, zstar, PredictionStar, α)
+
+    N = data["sample_size"]
+    z = ξ_dict["z"]
+    y_scen = ξ_dict["y"]
+    a = Ξ_y[:,1]
+    b = Ξ_y[:,2]
+
+    m = ceil(Int, N*α)
+
+    dist = zeros(N)
+
+    for n in 1:N
+
+        dz = norm(z[n] - zstar, 1)
+
+        dy = 0.0
+        for d in 1:D
+            if y_scen[n][d] < a[d]
+                dy += a[d] - y_scen[n][d]
+            elseif y_scen[n][d] > b[d]
+                dy += y_scen[n][d] - b[d]
+            end
+        end
+
+        dist[n] = dz + dy
+
+    end
+
+    idx = sortperm(dist)
+
+    y_list = []
+
+    for k in 1:m
+
+        n = idx[k]
+
+        yproj = clamp.(y_scen[n], a, b)
+        push!(y_list, yproj)
+
+    end
+
+    x = deterministic_equivalent_problem(data, instalations, demand, y_list)
+
+    for k ∈ 1:m 
+
+        n = idx[k]
+
+        yproj = y_list[k]
+
+        π_opt, σ_opt = dual_vertices(data, instalations, demand, x, yproj, PredictionStar)
+        norm_l1_z = norm(zstar - z[n], 1)
+        norm_l1_y = norm(yproj - y_scen[n], 1)
+
+        @constraint(m_master, sum(σ_opt[g]*m_master[:x][g] for g ∈ 1:G) + sum(π_opt[d]*yproj[d] for d ∈ 1:D) + sum(PredictionStar[d]*π_opt[d] for d ∈ 1:D) - m_master[:λ]*norm_l1_y - m_master[:λ]*norm_l1_z ≤ m_master[:μ][n] + m_master[:θ])
+
 
     end
 
@@ -580,7 +754,7 @@ L = Dict("$n" => [] for n ∈ sample)
 tol = [true for n ∈ sample]
 iter = 1
 m_master = create_master_problem(data, G, ρ)
-initilization_restricted_master_CCG(data, G, D, m_master, ξ_dict, Ξ_y, zstar, PredictionStar)
+initilization_restricted_master_CCG(data, instalations, demand, G, D, m_master, ξ_dict, Ξ_y, zstar, PredictionStar, α)
 m_oracle, obj  = create_oracle_problem(data, instalations, demand, G, D)
 while Base.any(tol) && iter ≤ 20
     global x_CCG, λ_CCG, μ_CCG, θ_CCG = solve_master_problem(m_master)
@@ -608,8 +782,8 @@ L = Dict("$n" => [] for n ∈ sample)
 tol = [true for n ∈ sample]
 iter = 1
 m_master = create_master_problem(data, G, ρ)
-@constraint(m_master, m_master[:θ] ≥ -1e4)
-# initilization_restricted_master_Benders(data, G, D, m_master, ξ_dict)
+# @constraint(m_master, m_master[:θ] ≥ -1e4)
+initilization_restricted_master_Benders(data, instalations, demand, G, D, m_master, ξ_dict, Ξ_y, zstar, PredictionStar, α)
 m_oracle, obj  = create_oracle_problem(data, instalations, demand, G, D)
 while Base.any(tol) && iter ≤ 100
     global x_Benders, λ_Benders, μ_Benders, θ_Benders = solve_master_problem(m_master)
